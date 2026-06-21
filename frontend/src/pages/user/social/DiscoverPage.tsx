@@ -9,6 +9,7 @@ import { postApi, friendApi, groupApi } from '@/api/services'
 import { useAuthStore } from '@/store/authStore'
 import toast from 'react-hot-toast'
 import clsx from 'clsx'
+import { visibleTags } from '@/utils/socialContent'
 
 const COLORS = ['#6366f1', '#14b8a6', '#f59e0b', '#ec4899', '#3b82f6', '#22c55e', '#f97316', '#8b5cf6']
 const SKILL_COLORS: Record<string, string> = {
@@ -391,8 +392,8 @@ export default function DiscoverPage() {
       </div>
 
       {tab === 'trending' && (
-        <div className="grid grid-cols-3 gap-5">
-          <div className="col-span-2 space-y-4">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-5">
+          <div className="space-y-4 sm:col-span-2">
             <div className="flex items-center justify-between">
               <h2 className="text-[14px] font-semibold" style={{ color: 'var(--text)' }}>
                 🔥 Blog học tập đang thịnh hành
@@ -439,16 +440,16 @@ export default function DiscoverPage() {
 
                       <div className="flex-1 min-w-0">
                         <div className="flex gap-1.5 mb-1.5 flex-wrap">
-                          {p.tags?.slice(0, 2).map((t: string, ti: number) => (
+                          {visibleTags(p.tags).slice(0, 2).map(tag => (
                             <span
-                              key={`${pid}-t-${ti}`}
+                              key={`${pid}-${tag.toLocaleLowerCase('vi')}`}
                               className="text-[10px] font-medium px-2 py-0.5 rounded-full"
                               style={{
-                                background: (SKILL_COLORS[t] ?? '#6366f1') + '18',
-                                color: SKILL_COLORS[t] ?? '#818cf8',
+                                background: (SKILL_COLORS[tag.slice(1)] ?? '#6366f1') + '18',
+                                color: SKILL_COLORS[tag.slice(1)] ?? '#818cf8',
                               }}
                             >
-                              #{t}
+                              {tag}
                             </span>
                           ))}
                         </div>
@@ -529,16 +530,16 @@ export default function DiscoverPage() {
                       style={{ background: 'var(--bg2)', borderColor: 'var(--border)' }}
                     >
                       <div className="flex gap-1.5 mb-2 flex-wrap">
-                        {p.tags?.slice(0, 1).map((t: string, ti: number) => (
+                        {visibleTags(p.tags).slice(0, 1).map(tag => (
                           <span
-                            key={`${p._id}-nt-${ti}`}
+                            key={`${p._id}-${tag.toLocaleLowerCase('vi')}`}
                             className="text-[9px] font-medium px-2 py-0.5 rounded-full"
                             style={{
-                              background: (SKILL_COLORS[t] ?? '#6366f1') + '18',
-                              color: SKILL_COLORS[t] ?? '#818cf8',
+                              background: (SKILL_COLORS[tag.slice(1)] ?? '#6366f1') + '18',
+                              color: SKILL_COLORS[tag.slice(1)] ?? '#818cf8',
                             }}
                           >
-                            #{t}
+                            {tag}
                           </span>
                         ))}
                       </div>
@@ -661,8 +662,8 @@ export default function DiscoverPage() {
       )}
 
       {tab === 'leaderboard' && (
-        <div className="grid grid-cols-3 gap-5">
-          <div className="col-span-2">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-5">
+          <div className="sm:col-span-2">
             <h2 className="text-[14px] font-semibold mb-4" style={{ color: 'var(--text)' }}>
               🏆 Bảng xếp hạng tuần này
             </h2>
@@ -825,14 +826,14 @@ export default function DiscoverPage() {
             👥 Nhóm học công khai — Có hiện mã để tham gia
           </h2>
 
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             {publicGroups.map((g: any) => {
               const alreadyJoined = joined.has(g.inviteCode) || isAlreadyInGroup(g)
 
               return (
                 <div
                   key={g.id}
-                  className="border rounded-xl p-5 transition-all hover:-translate-y-0.5"
+                  className="rounded-2xl border p-4 transition-all hover:-translate-y-0.5 sm:p-5"
                   style={{ background: 'var(--bg2)', borderColor: 'var(--border)' }}
                 >
                   <div className="flex items-start gap-3 mb-3">
@@ -846,8 +847,8 @@ export default function DiscoverPage() {
                       <Users size={18} style={{ color: g.coverColor ?? '#6366f1' }} />
                     </div>
 
-                    <div className="flex-1">
-                      <h3 className="text-[14px] font-semibold" style={{ color: 'var(--text)' }}>
+                    <div className="min-w-0 flex-1">
+                      <h3 className="text-[14px] font-semibold leading-snug" style={{ color: 'var(--text)' }}>
                         {g.name}
                       </h3>
                       <p className="text-[11px]" style={{ color: (g.coverColor ?? '#6366f1') + 'cc' }}>
@@ -868,7 +869,7 @@ export default function DiscoverPage() {
                     </span>
                   </div>
 
-                  <p className="text-[12px] mb-4 leading-relaxed" style={{ color: 'var(--text2)' }}>
+                  <p className="mb-4 line-clamp-3 text-[12px] leading-relaxed" style={{ color: 'var(--text2)' }}>
                     {g.description}
                   </p>
 
@@ -921,7 +922,7 @@ export default function DiscoverPage() {
             </p>
           </div>
 
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             {people.map((u: any) => {
               const skill = getMainSkill(u)
               const skillColor = SKILL_COLORS[skill] ?? '#818cf8'
