@@ -17,6 +17,7 @@ from main import (  # noqa: E402
     _build_scoped_kb_filter,
     _append_unique_quiz_questions,
     _is_language_vocabulary_request,
+    _is_study_scope_request,
     _looks_like_vocabulary_content,
     _preset_vocabulary_flashcards,
     _resolve_and_validate_file_url,
@@ -81,6 +82,23 @@ class SecurityAndRagTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             ChatMessage(text="")
 
+    def test_study_scope_allows_learning_requests_and_greetings(self):
+        self.assertTrue(_is_study_scope_request("Giải thích định luật Newton"))
+        self.assertTrue(_is_study_scope_request("Tạo quiz ôn thi tiếng Anh"))
+        self.assertTrue(_is_study_scope_request("Xin chào"))
+
+    def test_study_scope_blocks_clear_non_learning_requests(self):
+        self.assertFalse(_is_study_scope_request("Kể chuyện cười cho tôi"))
+        self.assertFalse(_is_study_scope_request("Gợi ý phim gì hay tối nay"))
+        self.assertFalse(_is_study_scope_request("Viết thư tình để tán người yêu"))
+
+    def test_group_scope_allows_study_group_management(self):
+        self.assertTrue(
+            _is_study_scope_request(
+                "Phân công task và deadline cho các thành viên",
+                group_mode=True,
+            )
+        )
     def test_chunking_preserves_overlap_and_bounds(self):
         text = "\n\n".join(
             [

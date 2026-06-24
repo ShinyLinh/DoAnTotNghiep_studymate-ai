@@ -78,6 +78,21 @@ class ProductionHardeningTests(unittest.TestCase):
         finally:
             main_module.AI_AGENT_SERVICE_KEY = previous_key
 
+    def test_off_topic_chat_is_blocked_without_calling_orchestrator(self):
+        previous = main_module.AI_AGENT_SERVICE_KEY
+        main_module.AI_AGENT_SERVICE_KEY = ""
+        try:
+            with patch.object(main_module, "get_orchestrator") as orchestrator:
+                response = TestClient(main_module.app).post(
+                    "/chat",
+                    json={"text": "Gợi ý phim gì hay tối nay"},
+                )
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.json()["scope_blocked"])
+            self.assertEqual(response.json()["agent"], "StudyScopeGuard")
+            orchestrator.assert_not_called()
+        finally:
+            main_module.AI_AGENT_SERVICE_KEY = previous
     def test_failed_chat_turn_is_not_written_to_history(self):
         session_id = "test:failed-turn"
         tenant_id = "test:tenant"

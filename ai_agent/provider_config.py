@@ -15,11 +15,13 @@ ProviderName = Literal["openrouter", "anthropic"]
 
 PROVIDER_MODELS = {
     "openrouter": [
-        {"id": "openai/gpt-oss-120b", "name": "GPT OSS 120B", "tier": "paid"},
-        {"id": "deepseek/deepseek-v4-flash", "name": "DeepSeek V4 Flash", "tier": "paid"},
-        {"id": "meta-llama/llama-3.3-70b-instruct", "name": "Llama 3.3 70B", "tier": "paid"},
-        {"id": "qwen/qwen3.7-plus", "name": "Qwen 3.7 Plus", "tier": "paid"},
+        {"id": "meta-llama/llama-3.2-3b-instruct:free", "name": "Llama 3.2 3B Instruct (free, nhẹ)", "tier": "free"},
+        {"id": "qwen/qwen3-next-80b-a3b-instruct:free", "name": "Qwen3 Next A3B (free, JSON tốt)", "tier": "free"},
         {"id": "openrouter/free", "name": "OpenRouter Free Router", "tier": "free"},
+        {"id": "anthropic/claude-haiku-4.5", "name": "Claude Haiku 4.5 (OpenRouter)", "tier": "paid"},
+        {"id": "anthropic/claude-3-haiku", "name": "Claude 3 Haiku (OpenRouter)", "tier": "paid"},
+        {"id": "openai/gpt-oss-120b", "name": "GPT OSS 120B", "tier": "paid"},
+        {"id": "meta-llama/llama-3.3-70b-instruct", "name": "Llama 3.3 70B", "tier": "paid"},
     ],
     "anthropic": [
         {"id": "claude-haiku-4-5", "name": "Claude Haiku 4.5", "tier": "paid"},
@@ -27,9 +29,8 @@ PROVIDER_MODELS = {
         {"id": "claude-opus-4-1", "name": "Claude Opus 4.1", "tier": "paid"},
     ],
 }
-
 DEFAULT_MODELS = {
-    "openrouter": "openai/gpt-oss-120b",
+    "openrouter": "anthropic/claude-haiku-4.5",
     "anthropic": "claude-haiku-4-5",
 }
 

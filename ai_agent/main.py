@@ -33,6 +33,7 @@ from provider_config import (
 )
 from llm_runtime import (
     LLMTurnTimeoutError,
+    classify_provider_error,
     provider_status,
     record_provider_failure,
 )
@@ -47,6 +48,7 @@ import os
 import hmac
 import logging
 import time
+import unicodedata
 from urllib.parse import urlparse
 
 from vocabulary import (
@@ -340,7 +342,11 @@ async def extract_text_from_upload(file: UploadFile) -> str:
 def _extract_json(raw: str) -> dict:
     cleaned = re_module.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
     try:
-        return json.loads(cleaned)
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, list):
+            return {"items": parsed}
     except json.JSONDecodeError:
         pass
 
@@ -364,29 +370,179 @@ def _extract_json(raw: str) -> dict:
     return {}
 
 
-def parse_flashcards(raw: str) -> list[dict]:
-    data  = _extract_json(raw)
-    cards = []
-    items = data.get("flashcards") or data.get("items") or []
-    if isinstance(items, list):
-        for item in items:
-            if not isinstance(item, dict):
+def _iter_complete_json_objects(raw: str):
+    """Yield complete JSON objects embedded in raw text, skipping a final truncated object."""
+    cleaned = re_module.sub(r"```(?:json)?\s*", "", raw or "").replace("```", "").strip()
+    decoder = json.JSONDecoder()
+    for match in re_module.finditer(r"\{", cleaned):
+        start = match.start()
+        depth = 0
+        in_string = False
+        escape = False
+        end = None
+        for index, char in enumerate(cleaned[start:], start=start):
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_string = False
                 continue
-            front = str(item.get("front") or item.get("question") or "").strip()
-            back  = str(item.get("back") or item.get("answer") or "").strip()
-            if front and back:
-                cards.append({
-                    "question": front,
-                    "answer":   back,
-                    "hint":     str(item.get("hint", "") or ""),
-                    "type":     str(item.get("type", "mixed") or "mixed"),
-                })
-        if cards:
-            return cards
-    if "flashcards" in data:
-        return cards
-    return _parse_flashcards_regex_fallback(raw)
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    end = index + 1
+                    break
+        if end is None:
+            continue
+        snippet = cleaned[start:end]
+        try:
+            item = json.loads(snippet)
+        except json.JSONDecodeError:
+            try:
+                item, _ = decoder.raw_decode(snippet)
+            except json.JSONDecodeError:
+                continue
+        if isinstance(item, dict):
+            yield item
 
+
+
+def _normalize_generated_flashcard_item(item: dict) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+    front = str(
+        item.get("front")
+        or item.get("question")
+        or item.get("term")
+        or item.get("prompt")
+        or item.get("word")
+        or item.get("title")
+        or ""
+    ).strip()
+    back = str(
+        item.get("back")
+        or item.get("answer")
+        or item.get("definition")
+        or item.get("meaning")
+        or item.get("explanation")
+        or item.get("description")
+        or ""
+    ).strip()
+    if not front or not back:
+        return None
+    return {
+        "question": front,
+        "answer": back,
+        "hint": str(item.get("hint", "") or ""),
+        "type": str(item.get("type", "mixed") or "mixed"),
+    }
+
+
+def _parse_flashcards_partial_json(raw: str) -> list[dict]:
+    """Recover complete flashcard objects when provider output is truncated mid-JSON."""
+    cards: list[dict] = []
+    seen: set[str] = set()
+
+    for item in _iter_complete_json_objects(raw):
+        card = _normalize_generated_flashcard_item(item)
+        if not card:
+            continue
+        key = card["question"].strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cards.append(card)
+    return cards
+
+
+def _normalize_generated_quiz_item(item: dict) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+    question = str(item.get("question") or item.get("prompt") or item.get("front") or "").strip()
+    opts = item.get("options") or item.get("choices") or item.get("answers") or []
+    opts = [str(o).strip() for o in opts if str(o).strip()] if isinstance(opts, list) else []
+    if not question or len(opts) < 2:
+        return None
+    raw_idx = item.get("correct_index", item.get("correctIndex", item.get("answer_index", 0)))
+    try:
+        correct_idx = int(raw_idx)
+    except (TypeError, ValueError):
+        if isinstance(raw_idx, str) and len(raw_idx) == 1 and raw_idx.upper() in "ABCD":
+            correct_idx = ord(raw_idx.upper()) - ord("A")
+        else:
+            correct_idx = 0
+    correct_idx = min(max(correct_idx, 0), len(opts) - 1)
+    return {
+        "question": question,
+        "options": opts,
+        "correctIndex": correct_idx,
+        "explanation": str(item.get("explanation", "") or "").strip(),
+    }
+
+
+def _parse_quiz_partial_json(raw: str) -> list[dict]:
+    """Recover complete quiz objects when provider output is truncated mid-JSON."""
+    questions: list[dict] = []
+    seen: set[str] = set()
+
+    for item in _iter_complete_json_objects(raw):
+        question = _normalize_generated_quiz_item(item)
+        if not question:
+            continue
+        key = question["question"].strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        questions.append(question)
+    return questions
+
+
+def parse_flashcards(raw: str) -> list[dict]:
+    data = _extract_json(raw)
+    cards: list[dict] = []
+
+    containers = []
+    if isinstance(data, dict):
+        containers.append(data)
+        for key in ("data", "result", "output"):
+            nested = data.get(key)
+            if isinstance(nested, dict):
+                containers.append(nested)
+
+    items = []
+    for container in containers:
+        for key in ("flashcards", "cards", "items"):
+            value = container.get(key)
+            if isinstance(value, list):
+                items = value
+                break
+        if items:
+            break
+
+    if not items and isinstance(data, dict) and any(k in data for k in ("front", "back", "question", "answer", "term", "definition", "prompt")):
+        items = [data]
+
+    for item in items:
+        card = _normalize_generated_flashcard_item(item)
+        if card:
+            cards.append(card)
+
+    partial_cards = _parse_flashcards_partial_json(raw)
+    if partial_cards and len(partial_cards) > len(cards):
+        return partial_cards
+    if cards:
+        return cards
+    if any(isinstance(container.get(key), list) for container in containers for key in ("flashcards", "cards", "items")):
+        return cards
+    if partial_cards:
+        return partial_cards
+    return _parse_flashcards_regex_fallback(raw)
 
 def _parse_flashcards_regex_fallback(raw: str) -> list[dict]:
     cards  = []
@@ -411,36 +567,43 @@ def _parse_flashcards_regex_fallback(raw: str) -> list[dict]:
 
 
 def parse_quiz(raw: str) -> list[dict]:
-    data      = _extract_json(raw)
-    questions = []
-    items = data.get("questions") or data.get("items") or []
-    if isinstance(items, list):
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            opts = item.get("options", [])
-            opts = [str(o).strip() for o in opts if str(o).strip()] if isinstance(opts, list) else []
-            if not item.get("question") or len(opts) < 2:
-                continue
-            raw_idx = item.get("correct_index", item.get("correctIndex", 0))
-            try:
-                correct_idx = int(raw_idx)
-            except (TypeError, ValueError):
-                if isinstance(raw_idx, str) and len(raw_idx) == 1 and raw_idx.upper() in "ABCD":
-                    correct_idx = ord(raw_idx.upper()) - ord("A")
-                else:
-                    correct_idx = 0
-            correct_idx = min(max(correct_idx, 0), len(opts) - 1)
-            questions.append({
-                "question":     str(item["question"]).strip(),
-                "options":      opts,
-                "correctIndex": correct_idx,
-                "explanation":  str(item.get("explanation", "") or "").strip(),
-            })
-        if questions:
-            return questions
-    if "questions" in data:
+    data = _extract_json(raw)
+    questions: list[dict] = []
+    containers = []
+    if isinstance(data, dict):
+        containers.append(data)
+        for key in ("data", "result", "output"):
+            nested = data.get(key)
+            if isinstance(nested, dict):
+                containers.append(nested)
+
+    items = []
+    for container in containers:
+        for key in ("questions", "items"):
+            value = container.get(key)
+            if isinstance(value, list):
+                items = value
+                break
+        if items:
+            break
+
+    if not items and isinstance(data, dict) and any(k in data for k in ("question", "options", "choices")):
+        items = [data]
+
+    for item in items:
+        question = _normalize_generated_quiz_item(item)
+        if question:
+            questions.append(question)
+
+    partial_questions = _parse_quiz_partial_json(raw)
+    if partial_questions and len(partial_questions) > len(questions):
+        return partial_questions
+    if questions:
         return questions
+    if any(isinstance(container.get(key), list) for container in containers for key in ("questions", "items")):
+        return questions
+    if partial_questions:
+        return partial_questions
     return _parse_quiz_regex_fallback(raw)
 
 
@@ -595,6 +758,12 @@ def _require_doc_labels(subject: str | None, doc_topic: str | None, has_file: bo
         )
 
 
+
+def _kb_filter_denies_access(where_filter: dict | None) -> bool:
+    if not where_filter:
+        return True
+    return "__no_tenant_access__" in json.dumps(where_filter, ensure_ascii=False)
+
 def _build_scoped_kb_filter(clf, tenant_id: str | None) -> dict | None:
     tenant = (tenant_id or "").strip()
     if not tenant:
@@ -703,36 +872,129 @@ def _remember_turn(session_id: str, user_text: str, assistant_text: str) -> None
 
 
 def _friendly_ai_error(e: Exception, used_user_key: bool = False) -> str:
-    msg = str(e).lower()
-    if isinstance(e, LLMTurnTimeoutError) or "turn exceeded" in msg:
-        return "AI phản hồi quá thời gian cho phép. Vui lòng thử lại với yêu cầu ngắn hơn."
-    if "capacity queue is full" in msg:
-        return "AI đang có nhiều yêu cầu cùng lúc. Vui lòng thử lại sau vài giây."
-    if "429" in msg or "rate-limit" in msg or "rate limit" in msg or "temporarily rate-limited" in msg:
-        if used_user_key:
-            return "Provider đang giới hạn tốc độ với API key của bạn. Hãy thử lại sau vài phút hoặc kiểm tra quota/key."
-        return (
-            "Hạn mức AI miễn phí của hệ thống đang tạm hết. Hãy thử lại sau, nâng cấp gói, "
-            "hoặc mở mục KEY để nhập OpenRouter/Anthropic API key của riêng bạn."
-        )
-    if "402" in msg or "credits" in msg or "afford" in msg or "billing" in msg:
-        if used_user_key:
-            return "API key của bạn không đủ credit cho model đã chọn. Hãy nạp thêm credit hoặc chọn OpenRouter Free."
-        return (
-            "Credit của model AI hiện tại không đủ. Hệ thống đang chuyển sang model miễn phí; "
-            "nếu lỗi tiếp diễn, hãy thử lại sau hoặc nhập API key riêng."
-        )
-    if "api key" in msg or "authentication" in msg or "401" in msg:
-        return "API key không hợp lệ hoặc thiếu quyền truy cập model. Vui lòng kiểm tra lại key."
-    return "AI service đang bận hoặc provider tạm thời không phản hồi. Vui lòng thử lại sau."
+    return classify_provider_error(e, used_user_key=used_user_key)["message"]
+
+
+def _ai_error_payload(e: Exception, used_user_key: bool = False) -> dict:
+    error = classify_provider_error(e, used_user_key=used_user_key)
+    return {
+        "code": error["code"],
+        "message": error["message"],
+        "retryable": error["retryable"],
+    }
+
+
+def _configured_item_limit(env_name: str, default: int, hard_cap: int = 100) -> int:
+    try:
+        value = int(os.getenv(env_name, str(default)))
+    except ValueError:
+        value = default
+    return min(max(value, 1), hard_cap)
 
 
 def _extract_requested_count(text: str, default: int, max_value: int) -> int:
-    match = re.search(r"\b(\d{1,2})\b", text or "")
+    normalized = _scope_normalize(text or "")
+    if re.search(r"\b(nhieu nhat|toi da|cang nhieu cang tot|het co the|duoc bao nhieu hay bay nhieu)\b", normalized):
+        return max_value
+    match = re.search(r"\b(\d{1,3})\b", text or "")
     if not match:
         return default
     return min(max(int(match.group(1)), 1), max_value)
 
+
+STUDY_SCOPE_REFUSAL = (
+    "Mình chỉ hỗ trợ các nội dung liên quan đến học tập. "
+    "Bạn hãy đặt câu hỏi về bài học, bài tập, ôn thi, kỹ năng, "
+    "lập trình, ngoại ngữ hoặc định hướng học tập nhé."
+)
+
+
+
+def _is_vague_flashcard_request(text: str) -> bool:
+    """Return True when the user asks for flashcards but gives no usable topic."""
+    normalized = _scope_normalize(text)
+    if not normalized:
+        return True
+    specific_markers = (
+        r"\b(toan|vat ly|hoa hoc|sinh hoc|ngu van|lich su|dia ly|tieng anh|tieng han|"
+        r"tieng nhat|tieng trung|lap trinh|python|java|javascript|sql|dao ham|tich phan|"
+        r"ham so|phuong trinh|hinh hoc|xac suat|kinh te|marketing|phap luat|triet hoc|"
+        r"tam ly hoc|mang may tinh|co so du lieu|ai|machine learning)\b"
+    )
+    if re.search(specific_markers, normalized):
+        return False
+    meaningful = re.sub(
+        r"\b(toi|minh|em|anh|chi|muon|can|hay|giup|tao|lam|cho|xin|flashcards?|flash|cards?|"
+        r"the|ghi|nho|hoc|on|tap|tong|hop|kien|thuc|noi|dung|chu|de|ve|cac|nhung|mot|vai|bo|bai|mon)\b",
+        " ",
+        normalized,
+    )
+    meaningful = re.sub(r"\b\d{1,2}\b", " ", meaningful)
+    tokens = [token for token in meaningful.split() if len(token) > 1]
+    return len(tokens) == 0
+
+def _scope_normalize(text: str) -> str:
+    normalized = unicodedata.normalize("NFD", (text or "").lower())
+    normalized = "".join(char for char in normalized if unicodedata.category(char) != "Mn")
+    normalized = normalized.replace("đ", "d")
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _is_study_scope_request(text: str, *, has_history: bool = False, group_mode: bool = False) -> bool:
+    """Block clearly non-study requests before spending an LLM call."""
+    normalized = _scope_normalize(text)
+    if not normalized:
+        return False
+
+    greeting_only = re.fullmatch(
+        r"(xin chao|chao|hello|hi|hey|alo|cam on|thank you|thanks)[!. ]*",
+        normalized,
+    )
+    if greeting_only:
+        return True
+
+    study_markers = (
+        r"\b(hoc|bai hoc|bai tap|on thi|luyen thi|de thi|giai thich|phan tich|"
+        r"nghien cuu|tai lieu|giao trinh|kien thuc|ky nang|lap trinh|code|"
+        r"toan|vat ly|hoa hoc|sinh hoc|ngu van|lich su|dia ly|ngoai ngu|"
+        r"tieng anh|tieng han|tieng nhat|tieng trung|kinh te|phap luat|"
+        r"triet hoc|tam ly hoc|quiz|flashcard|tom tat|luan van|bao cao|"
+        r"thuyet trinh|dai hoc|cao dang|tuyen sinh|nganh hoc|mon hoc)\b"
+    )
+    learning_frame = re.search(
+        r"\b(day toi|huong dan|giai bai|chung minh|so sanh|danh gia|"
+        r"viet bai|lap dan y|tao cau hoi|cho vi du|cong thuc|khai niem|"
+        r"la gi|vi sao|tai sao|hoat dong nhu the nao)\b",
+        normalized,
+    )
+    if re.search(study_markers, normalized) or learning_frame:
+        return True
+
+    if group_mode and re.search(
+        r"\b(nhom|thanh vien|phan cong|cong viec|nhiem vu|task|deadline|"
+        r"lich|tien do|vai tro|du an)\b",
+        normalized,
+    ):
+        return True
+
+    off_topic_patterns = (
+        r"\b(ke chuyen cuoi|noi dua|roleplay|nhap vai|boi tinh|tu vi)\b",
+        r"\b(ca cuoc|danh bac|lo de|so xo|keo bong|betting)\b",
+        r"\b(tan gai|tan trai|nguoi yeu|hen ho|thu tinh|chia tay)\b",
+        r"\b(gossip|tin don|drama|scandal|showbiz)\b",
+        r"\b(goi y phim|phim gi hay|nhac gi hay|playlist|game gi hay)\b",
+        r"\b(mua gi|shopping|san deal|ma giam gia|review san pham)\b",
+        r"\b(nau mon|cong thuc nau|thuc don|hom nay an gi)\b",
+        r"\b(lich du lich|dat phong|khach san|dia diem check in)\b",
+        r"\b(du doan ty so|ket qua bong da|bang xep hang)\b",
+        r"\b(viet caption|status facebook|bai dang song ao)\b",
+    )
+    if any(re.search(pattern, normalized) for pattern in off_topic_patterns):
+        return False
+
+    if has_history and len(normalized.split()) <= 16:
+        return True
+    return True
 
 def _detect_chat_route(text: str) -> str | None:
     normalized = (text or "").lower()
@@ -740,7 +1002,7 @@ def _detect_chat_route(text: str) -> str | None:
 
     route_rules = [
         ("quiz", r"\b(quiz|trac nghiem|trắc nghiệm|cau hoi|câu hỏi|kiem tra|kiểm tra|de on|đề ôn)\b"),
-        ("flashcard", r"\b(flashcards?|flash cards?|the ghi nho|thẻ ghi nhớ|the hoc|thẻ học|on tu|ôn từ)\b"),
+        ("flashcard", r"\b(flashcards?|flahcards?|flash cards?|flah cards?|the ghi nho|thẻ ghi nhớ|the hoc|thẻ học|on tu|ôn từ)\b"),
         ("summary", r"\b(tom tat|tóm tắt|rut gon|rút gọn|dan y|dàn ý|outline|mindmap|so do|sơ đồ)\b"),
         ("tutor", r"\b(giai thich|giải thích|huong dan|hướng dẫn|vi sao|vì sao|tai sao|tại sao|la gi|là gì)\b"),
     ]
@@ -943,7 +1205,7 @@ async def _compact_flashcard_fallback(text: str, context: dict | None) -> list[d
 async def _run_fast_chat_route(route: str, orch, text: str, context: dict | None, history: list) -> tuple[str, str, dict | None, list[dict]]:
     manual_sources: list[dict] = []
     if route == "quiz":
-        requested = _extract_requested_count(text, default=20, max_value=20)
+        requested = _extract_requested_count(text, default=20, max_value=_configured_item_limit("QUIZ_MAX_ITEMS", 60))
         n = 1 if _low_credit_structured_mode() else requested
         if _low_credit_structured_mode():
             kb_content = ""
@@ -981,18 +1243,34 @@ async def _run_fast_chat_route(route: str, orch, text: str, context: dict | None
         response = _json_response_from_structured(structured)
         if not response:
             response = (
-                "Không tạo được quiz vì credit AI hiện không đủ cho JSON hợp lệ. "
-                "Hãy nạp thêm OpenRouter credit hoặc nhập API key riêng."
+                "AI đã phản hồi nhưng chưa đúng định dạng JSON quiz. "
+                "Hãy thử lại với yêu cầu ngắn hơn hoặc giảm số lượng câu."
+            )
+        elif response and len(questions) < n:
+            response = (
+                f"AI tao duoc {len(questions)}/{n} cau quiz hop le trong gioi han token hien tai.\n"
+                f"{response}"
             )
         elif requested > n:
             response = (
-                f"Credit AI đang thấp nên hệ thống tạo {len(questions)}/{requested} câu.\n"
+                f"Credit AI dang thap nen he thong tao {len(questions)}/{requested} cau.\n"
                 f"{response}"
             )
         return response, "QuizAgent", structured, manual_sources
 
     if route == "flashcard":
-        requested = _extract_requested_count(text, default=5, max_value=20)
+        requested = _extract_requested_count(text, default=5, max_value=_configured_item_limit("FLASHCARD_MAX_ITEMS", 60))
+        kb_filter = (context or {}).get("kb_filter")
+        has_usable_kb = bool(kb_filter) and not _kb_filter_denies_access(kb_filter)
+        if _is_vague_flashcard_request(text) and not has_usable_kb:
+            return (
+                "Nếu bạn không nhập số lượng, mình sẽ mặc định tạo 5 flashcard. "
+                "Nhưng mình cần thêm chủ đề/môn học để tạo đúng nội dung, ví dụ: "
+                "Tạo flashcard tổng hợp kiến thức về đạo hàm, lịch sử Việt Nam, hoặc từ vựng tiếng Anh A2.",
+                "FlashcardAgent",
+                None,
+                manual_sources,
+            )
         n = 1 if _low_credit_structured_mode() else requested
         language_result = await _language_vocabulary_flashcards(text, n, context)
         if language_result is not None:
@@ -1029,21 +1307,36 @@ async def _run_fast_chat_route(route: str, orch, text: str, context: dict | None
             raw = await orch.flashcard.run(message=task, context=context)
             cards = parse_flashcards(raw)
         if _flashcards_have_suspicious_text(cards, n) and STRUCTURED_OUTPUT_RETRIES > 0:
+            best_raw = raw
+            best_cards = list(cards)
             retry = (
-                f"{task}\n\nOutput trước không đạt chất lượng. Tạo lại đủ {n} thẻ, "
-                "nghĩa chính xác, không trùng, không ký tự lạ và chỉ trả JSON hợp lệ."
+                f"{task}\n\nOutput truoc khong dat chat luong. Tao lai du {n} the, "
+                "nghia chinh xac, khong trung, khong ky tu la va chi tra JSON hop le."
             )
-            raw = await orch.flashcard.run(message=retry, context=context)
-            cards = parse_flashcards(raw)
+            retry_raw = await orch.flashcard.run(message=retry, context=context)
+            retry_cards = parse_flashcards(retry_raw)
+            if len(retry_cards) >= len(best_cards):
+                raw = retry_raw
+                cards = retry_cards
+            else:
+                raw = best_raw
+                cards = best_cards
         if _flashcards_have_suspicious_text(cards, n):
-            cards = []
-            logger.warning("Flashcard output could not be parsed: %r", raw[:1000])
+            if not cards:
+                logger.warning("Flashcard output could not be parsed: %r", raw[:1000])
+            else:
+                logger.warning("Flashcard output was partial: expected=%s actual=%s preview=%r", n, len(cards), raw[:1000])
         structured = _structured_flashcards(cards)
         response = _json_response_from_structured(structured)
+        if response and len(cards) < n:
+            response = (
+                f"AI tạo được {len(cards)}/{n} flashcard hợp lệ trong giới hạn token hiện tại.\n"
+                f"{response}"
+            )
         if not response:
             response = (
-                "Không tạo được flashcard vì credit AI hiện không đủ cho JSON hợp lệ. "
-                "Hãy nạp thêm OpenRouter credit hoặc nhập API key riêng."
+                "AI đã phản hồi nhưng chưa đúng định dạng JSON flashcard. "
+                "Hãy thử lại với yêu cầu ngắn hơn hoặc giảm số lượng thẻ."
             )
         elif requested > n:
             response = (
@@ -1163,13 +1456,28 @@ async def chat(msg: ChatMessage):
     sid = msg.session_id or str(uuid.uuid4())
     tenant_id = (msg.tenant_id or "").strip()
     account_id = (msg.account_id or "").strip()
+    storage_sid = f"{tenant_id}::{sid}" if tenant_id else sid
+    history = chat_store.get_history(storage_sid, limit=CHAT_HISTORY_FOR_LLM)
+    if not _is_study_scope_request(msg.text, has_history=bool(history)):
+        return {
+            "session_id": sid,
+            "response": STUDY_SCOPE_REFUSAL,
+            "agent": "StudyScopeGuard",
+            "route": "scope_guard",
+            "structured": None,
+            "sources": [],
+            "classification": None,
+            "error": None,
+            "scope_blocked": True,
+            "ai_config": {"mode": "not_used"},
+        }
+
     intro_priority_limit = max(0, int(os.getenv("AI_INTRO_PRIORITY_REQUESTS", "3")))
     intro_priority = (
         not bool(msg.api_key and msg.api_key.strip())
         and chat_store.claim_intro_priority(account_id, intro_priority_limit)
     )
-    storage_sid = f"{tenant_id}::{sid}" if tenant_id else sid
-    history = chat_store.get_history(storage_sid, limit=CHAT_HISTORY_FOR_LLM)
+
 
     clf = classification_from_subject(
         subject=msg.subject,
@@ -1184,6 +1492,24 @@ async def chat(msg: ChatMessage):
     # Ordinary chat does not need an extra LLM orchestration round-trip.
     # Specialized requests still use deterministic routes below.
     route         = _detect_chat_route(msg.text) or "tutor"
+    has_usable_kb = bool(tenant_id and kb_filter and not _kb_filter_denies_access(kb_filter))
+    if route == "flashcard" and _is_vague_flashcard_request(msg.text) and not has_usable_kb:
+        return {
+            "session_id": sid,
+            "response": (
+                "Nếu bạn không nhập số lượng, mình sẽ mặc định tạo 5 flashcard. "
+                "Nhưng mình cần thêm chủ đề/môn học để tạo đúng nội dung, ví dụ: "
+                "Tạo flashcard tổng hợp kiến thức về đạo hàm, lịch sử Việt Nam, hoặc từ vựng tiếng Anh A2."
+            ),
+            "agent": "FlashcardAgent",
+            "route": "flashcard",
+            "structured": None,
+            "sources": [],
+            "classification": classification_to_api(clf),
+            "error": None,
+            "scope_blocked": False,
+            "ai_config": {"mode": "not_used"},
+        }
     run_context   = {}
     if kb_filter:
         run_context["kb_filter"] = kb_filter
@@ -1192,6 +1518,7 @@ async def chat(msg: ChatMessage):
     run_context = _request_ai_context(msg, run_context)
     prefetched_sources: list[dict] = []
     request_succeeded = False
+    error_info = None
     try:
         if tenant_id and kb_filter and route not in {"quiz", "flashcard"}:
             kb_content, prefetched_sources = await _search_kb_context(
@@ -1241,7 +1568,11 @@ async def chat(msg: ChatMessage):
             msg.model,
             bool(msg.api_key and msg.api_key.strip()),
         )
-        response = _friendly_ai_error(e, used_user_key=bool(msg.api_key and msg.api_key.strip()))
+        error_info = _ai_error_payload(
+            e,
+            used_user_key=bool(msg.api_key and msg.api_key.strip()),
+        )
+        response = error_info["message"]
         agent_name = "System"
         structured = None
         manual_sources = []
@@ -1276,6 +1607,8 @@ async def chat(msg: ChatMessage):
         "structured": structured,
         "sources":    manual_sources or meta.get("sources", []),
         "classification": classification_to_api(clf) if clf.subject_code != "other" else None,
+        "error": error_info,
+        "scope_blocked": False,
         "ai_config": {
             "mode": "byok" if msg.api_key and msg.api_key.strip() else "system_free",
             "intro_priority": intro_priority,
@@ -1287,7 +1620,13 @@ async def chat(msg: ChatMessage):
             "model": (
                 validate_model(msg.provider, msg.model)
                 if msg.api_key and msg.api_key.strip()
-                else os.getenv("AI_AGENT_MODEL", "openrouter/free")
+                else (
+                    os.getenv("AI_STRUCTURED_MODEL", "openrouter/free")
+                    if route in {"quiz", "flashcard"}
+                    else os.getenv("AI_SUMMARY_MODEL", os.getenv("AI_AGENT_MODEL", "openrouter/free"))
+                    if route == "summary"
+                    else os.getenv("AI_CHAT_MODEL", os.getenv("AI_AGENT_MODEL", "openrouter/free"))
+                )
             ),
         },
     }
@@ -1298,6 +1637,25 @@ async def chat(msg: ChatMessage):
 @app.post("/group-assistant")
 async def group_assistant(req: GroupAssistantRequest):
     """Call GroupAgent directly with the group's current data."""
+    if not _is_study_scope_request(req.request, has_history=bool(req.history), group_mode=True):
+        if req.response_format == "task_plan":
+            return {
+                "agent": "StudyScopeGuard",
+                "response": json.dumps(
+                    {"summary": STUDY_SCOPE_REFUSAL, "tasks": []},
+                    ensure_ascii=False,
+                ),
+                "proposal": {"summary": STUDY_SCOPE_REFUSAL, "tasks": []},
+                "summary": STUDY_SCOPE_REFUSAL,
+                "tasks": [],
+                "scope_blocked": True,
+            }
+        return {
+            "agent": "StudyScopeGuard",
+            "response": STUDY_SCOPE_REFUSAL,
+            "scope_blocked": True,
+        }
+
     members = [
         {
             "id": str(item.get("id") or "").strip()[:120],
@@ -1382,12 +1740,17 @@ async def group_assistant(req: GroupAssistantRequest):
             req.model,
             bool(req.api_key and req.api_key.strip()),
         )
+        error = classify_provider_error(
+            exc,
+            used_user_key=bool(req.api_key and req.api_key.strip()),
+        )
         raise HTTPException(
-            status_code=503,
-            detail=_friendly_ai_error(
-                exc,
-                used_user_key=bool(req.api_key and req.api_key.strip()),
-            ),
+            status_code=error["status"],
+            detail={
+                "code": error["code"],
+                "message": error["message"],
+                "retryable": error["retryable"],
+            },
         ) from exc
 
     response = {
@@ -2012,6 +2375,17 @@ def list_subjects():
 
 
 # ── HISTORY ────────────────────────────────────────────
+
+@app.get("/sessions")
+def list_chat_sessions(tenant_id: str, limit: int = 5):
+    """List recent AI conversations for the authenticated tenant."""
+    tenant = tenant_id.strip()
+    if not tenant:
+        raise HTTPException(status_code=422, detail="Cần tenant_id để tải lịch sử chat.")
+    return {
+        "sessions": chat_store.list_sessions(tenant, limit=limit),
+        "limit": max(1, min(limit, 20)),
+    }
 
 @app.delete("/history")
 def clear_history(session_id: str, tenant_id: Optional[str] = None):
